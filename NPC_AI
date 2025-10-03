@@ -1,0 +1,414 @@
+using UnityEngine;
+using UnityEngine.AI;
+using System.Collections;
+using Random = UnityEngine.Random;
+
+[RequireComponent(typeof(NavMeshAgent))]
+[RequireComponent(typeof(Animator))]
+[RequireComponent(typeof(SphereCollider))]
+public class NPC_AI : MonoBehaviour
+{
+    [Header("Patrol Settings")]
+    public Transform[] patrolPoints;
+    public float patrolSpeed = 3.0f;
+    [Tooltip("Hedefe gelince duracağı minimum mesafe.")]
+    public float patrolStoppingDistance = 0.5f;
+    [Tooltip("Ajanın hedefe ulaştığını kabul etmesi için kalan mesafe.")]
+    public float patrolArrivalThreshold = 3.5f;
+    public float idleTimeAtPoint = 2f;
+
+    [Header("Chase & Search Settings")]
+    public Transform player;
+    public float chaseSpeed = 6.0f;
+    public float chaseStoppingDistance = 0.8f;
+    public float searchDuration = 8f;
+    [Tooltip("Arama modunda rastgele nokta üretme mesafesi.")]
+    public float searchRadius = 10f;
+
+    [Header("Detection Settings")]
+    public float detectionRadius = 15f;
+    public float fieldOfViewAngle = 120f;
+    public LayerMask obstacleMask;
+
+    [Header("Unpredictability Settings")]
+    [Range(0f, 1f)] public float cackleChance = 0.3f;
+    public float cackleIntervalMin = 40f;
+    public float cackleIntervalMax = 60f;
+    public float cackleAnimationDuration = 2.0f;
+
+    [Header("Audio Settings")]
+    public AudioClip[] cackleSounds;
+    [Range(0f, 1f)] public float audioVolume = 0.7f;
+
+    private NavMeshAgent agent;
+    private Animator anim;
+    private AudioSource audioSource;
+    private int currentPoint = 0;
+    private Coroutine currentRoutine;
+
+    private enum AIState { Patrol, Chase, Search, Cackle }
+    private AIState currentState = AIState.Patrol;
+    private Vector3 lastSeenPlayerPosition;
+    private float nextCackleTime;
+    private const float RotationSpeed = 10f; // Manuel dönüş hızı
+
+    void Start()
+    {
+        agent = GetComponent<NavMeshAgent>();
+        anim = GetComponent<Animator>();
+        audioSource = gameObject.AddComponent<AudioSource>();
+        audioSource.playOnAwake = false;
+        audioSource.volume = audioVolume;
+
+        // Player'ı otomatik bulma
+        if (player == null)
+        {
+            GameObject playerObj = GameObject.FindGameObjectWithTag("Player");
+            if (playerObj != null) player = playerObj.transform;
+        }
+
+        // NavMeshAgent başlangıç ayarları
+        agent.speed = patrolSpeed;
+        agent.updateRotation = false; // Manuel rotasyon
+        agent.autoBraking = true;
+        agent.stoppingDistance = patrolStoppingDistance;
+
+        // Collider ayarları
+        SphereCollider col = GetComponent<SphereCollider>();
+        col.isTrigger = true;
+        col.radius = detectionRadius;
+
+        // İlk alay etme zamanı
+        nextCackleTime = Time.time + Random.Range(cackleIntervalMin, cackleIntervalMax);
+
+        if (patrolPoints != null && patrolPoints.Length > 0)
+        {
+            // En yakın devriye noktasından başla
+            currentPoint = GetClosestPatrolPointIndex();
+            currentRoutine = StartCoroutine(PatrolRoutine());
+        }
+        else
+        {
+            Debug.LogError("Patrol Points eksik! NPC hareket etmeyecektir.", this);
+        }
+    }
+
+    void Update()
+    {
+        if (player == null) return;
+
+        // Cackle durumundaysa hareket veya dönüş yapma
+        if (currentState == AIState.Cackle)
+        {
+            anim.SetFloat("Forward", 0f);
+            return;
+        }
+
+        // --- Animasyon Hızını Kontrol Etme ---
+        float currentSpeed = agent.velocity.magnitude;
+        float maxSpeed = (currentState == AIState.Chase) ? chaseSpeed : patrolSpeed;
+        float targetAnimRatio = (currentState == AIState.Chase) ? 1f : 0.5f;
+
+        float targetAnimSpeed = currentSpeed / maxSpeed * targetAnimRatio;
+        // Yumuşak geçiş
+        float animSpeed = Mathf.Lerp(anim.GetFloat("Forward"), targetAnimSpeed, Time.deltaTime * 5f);
+        anim.SetFloat("Forward", animSpeed);
+
+        // --- Manuel Smooth Rotation (Dönüş) ---
+        if (agent.hasPath && !agent.isStopped && agent.velocity.sqrMagnitude > 0.01f)
+        {
+            Vector3 flatVelocity = agent.velocity;
+            flatVelocity.y = 0;
+            if (flatVelocity.magnitude > 0.01f)
+            {
+                Quaternion targetRot = Quaternion.LookRotation(flatVelocity);
+                transform.rotation = Quaternion.Slerp(transform.rotation, targetRot, Time.deltaTime * RotationSpeed);
+            }
+        }
+
+        // --- Detection & State Logic ---
+        bool canSeePlayer = CanSeePlayer();
+        if (canSeePlayer)
+        {
+            lastSeenPlayerPosition = player.position;
+            if (currentState != AIState.Chase)
+            {
+                EnterChaseState();
+            }
+        }
+        else if (currentState == AIState.Chase)
+        {
+            // Oyuncuyu görmeyi bırakırsa ve mesafesi çok açılırsa Search'e geç
+            if (Vector3.Distance(transform.position, player.position) > detectionRadius * 1.5f)
+            {
+                EnterSearchState();
+            }
+        }
+
+        // --- Cackle logic (Sadece Patrol veya Search modunda) ---
+        if ((currentState == AIState.Patrol || currentState == AIState.Search) && Time.time >= nextCackleTime)
+        {
+            if (Random.value <= cackleChance)
+            {
+                StartCoroutine(CackleRoutine());
+            }
+            // Başarısız olsa bile bir sonraki deneme süresini ayarla
+            nextCackleTime = Time.time + Random.Range(cackleIntervalMin, cackleIntervalMax);
+        }
+    }
+
+    // --- Helper Methods ---
+
+    bool CanSeePlayer()
+    {
+        if (player == null) return false;
+
+        Vector3 dirToPlayer = player.position - transform.position;
+        float distance = dirToPlayer.magnitude;
+
+        // 1. Mesafe Kontrolü
+        if (distance > detectionRadius) return false;
+
+        // 2. Açı (Görüş Alanı) Kontrolü
+        if (Vector3.Angle(transform.forward, dirToPlayer) > fieldOfViewAngle * 0.5f) return false;
+
+        // 3. Raycast (Engel) Kontrolü
+        Vector3 rayOrigin = transform.position + Vector3.up * 1.6f;
+        if (Physics.Raycast(rayOrigin, dirToPlayer.normalized, out RaycastHit hit, distance, obstacleMask))
+        {
+            // Çarptığı obje oyuncu değilse (daha gelişmiş bir kontroldür bu)
+            if (hit.transform != player)
+            {
+                return false; // Duvar/obje tarafından engellendi.
+            }
+        }
+
+        return true;
+    }
+
+    // --- State Enter Methods ---
+
+    void EnterPatrolState()
+    {
+        if (currentRoutine != null) StopCoroutine(currentRoutine);
+        currentState = AIState.Patrol;
+        agent.isStopped = false;
+        agent.speed = patrolSpeed;
+        agent.stoppingDistance = patrolStoppingDistance;
+        currentRoutine = StartCoroutine(PatrolRoutine());
+    }
+
+    void EnterChaseState()
+    {
+        if (currentRoutine != null) StopCoroutine(currentRoutine);
+        currentState = AIState.Chase;
+        agent.isStopped = false;
+        agent.speed = chaseSpeed;
+        agent.stoppingDistance = chaseStoppingDistance;
+        currentRoutine = StartCoroutine(ChaseRoutine());
+    }
+
+    void EnterSearchState()
+    {
+        if (currentRoutine != null) StopCoroutine(currentRoutine);
+        currentState = AIState.Search;
+        agent.isStopped = false;
+        agent.speed = patrolSpeed * 1.3f; // Aramada biraz daha hızlı yürü
+        agent.stoppingDistance = patrolStoppingDistance;
+        currentRoutine = StartCoroutine(SearchRoutine());
+    }
+
+    // --- Coroutines ---
+
+    IEnumerator PatrolRoutine()
+    {
+        while (currentState == AIState.Patrol)
+        {
+            if (patrolPoints == null || patrolPoints.Length == 0 || currentPoint >= patrolPoints.Length)
+            {
+                yield break;
+            }
+
+            Vector3 target = patrolPoints[currentPoint].position;
+            agent.SetDestination(target);
+            agent.isStopped = false;
+
+            float maxStuckTime = 4f;
+            float stuckTimer = 0f;
+
+            // Varış kontrolü ve takılma engeli
+            while (agent.pathPending ||
+                   (agent.remainingDistance > agent.stoppingDistance &&
+                    Vector3.Distance(transform.position, target) > patrolArrivalThreshold))
+            {
+                // Ajan gerçekten hareket etmiyorsa zamanlayıcıyı say.
+                if (agent.velocity.sqrMagnitude < 0.01f && !agent.pathPending && agent.hasPath)
+                {
+                    stuckTimer += Time.deltaTime;
+                }
+                else
+                {
+                    stuckTimer = 0f; // Hareket varsa sıfırla
+                }
+
+                if (stuckTimer > maxStuckTime)
+                {
+                    Debug.LogWarning($"Agent stuck in Patrol, moving to next point: {gameObject.name}");
+                    break;
+                }
+
+                yield return null;
+                if (currentState != AIState.Patrol) yield break;
+            }
+
+            // Ulaştı (veya takılmadan dolayı çıktı), dur ve bekle
+            agent.isStopped = true;
+            anim.SetFloat("Forward", 0f);
+
+            yield return new WaitForSeconds(idleTimeAtPoint);
+
+            agent.isStopped = false;
+
+            // Bir sonraki noktaya geç
+            currentPoint = (currentPoint + 1) % patrolPoints.Length;
+        }
+    }
+
+    IEnumerator ChaseRoutine()
+    {
+        while (currentState == AIState.Chase && player != null)
+        {
+            agent.isStopped = false;
+            agent.SetDestination(player.position);
+            yield return null;
+        }
+    }
+
+    IEnumerator SearchRoutine()
+    {
+        Vector3 searchTarget = lastSeenPlayerPosition;
+        agent.SetDestination(searchTarget);
+        agent.isStopped = false;
+
+        float timer = 0f;
+        float maxWaitTime = 4f;
+        float waitTimer = 0f;
+
+        while (timer < searchDuration && currentState == AIState.Search)
+        {
+            // Etrafı kontrol etmek için yavaşça dönme
+            transform.Rotate(0, 30 * Time.deltaTime, 0);
+
+            // Varış kontrolü
+            bool reachedTarget = agent.remainingDistance <= agent.stoppingDistance * 1.1f && !agent.pathPending;
+
+            if (reachedTarget)
+            {
+                agent.isStopped = true;
+                anim.SetFloat("Forward", 0f);
+
+                yield return new WaitForSeconds(1.5f);
+
+                agent.isStopped = false;
+
+                // Yeni bir rastgele arama noktası belirle (NavMesh üzerinde geçerli olmalı)
+                if (currentState == AIState.Search)
+                {
+                    Vector3 randomOffset = Random.insideUnitSphere * searchRadius;
+                    randomOffset.y = 0;
+
+                    if (NavMesh.SamplePosition(lastSeenPlayerPosition + randomOffset, out NavMeshHit hit, searchRadius, NavMesh.AllAreas))
+                    {
+                        searchTarget = hit.position;
+                        agent.SetDestination(searchTarget);
+                        waitTimer = 0f;
+                    }
+                }
+            }
+
+            // Eğer hareket etmiyorsa (takıldıysa) yeni bir hedef dene
+            if (agent.velocity.sqrMagnitude < 0.01f)
+            {
+                waitTimer += Time.deltaTime;
+                if (waitTimer > maxWaitTime)
+                {
+                    Vector3 randomOffset = Random.insideUnitSphere * searchRadius;
+                    randomOffset.y = 0;
+                    if (NavMesh.SamplePosition(lastSeenPlayerPosition + randomOffset, out NavMeshHit hit, searchRadius, NavMesh.AllAreas))
+                    {
+                        searchTarget = hit.position;
+                        agent.SetDestination(searchTarget);
+                        waitTimer = 0f;
+                    }
+                }
+            }
+            else
+            {
+                waitTimer = 0f;
+            }
+
+            timer += Time.deltaTime;
+            yield return null;
+        }
+
+        // Arama süresi bitti, Devriye moduna dön
+        EnterPatrolState();
+    }
+
+    IEnumerator CackleRoutine()
+    {
+        AIState previousState = currentState;
+        currentState = AIState.Cackle;
+        if (currentRoutine != null) StopCoroutine(currentRoutine);
+
+        agent.isStopped = true;
+        agent.velocity = Vector3.zero;
+        anim.SetFloat("Forward", 0f); // Animasyon durdur
+
+        anim.SetTrigger("Cackle");
+
+        if (cackleSounds != null && cackleSounds.Length > 0)
+        {
+            AudioClip clip = cackleSounds[Random.Range(0, cackleSounds.Length)];
+            audioSource.PlayOneShot(clip, audioVolume);
+        }
+
+        yield return new WaitForSeconds(cackleAnimationDuration);
+
+        // İşlem bittikten sonra önceki duruma dön
+        agent.isStopped = false;
+
+        if (previousState == AIState.Chase)
+        {
+            EnterChaseState();
+        }
+        else if (previousState == AIState.Search)
+        {
+            EnterSearchState();
+        }
+        else // Patrol
+        {
+            EnterPatrolState();
+        }
+    }
+
+    // --- Initialization Helper ---
+
+    int GetClosestPatrolPointIndex()
+    {
+        if (patrolPoints == null || patrolPoints.Length == 0) return 0;
+
+        int closest = 0;
+        float minDist = Mathf.Infinity;
+        for (int i = 0; i < patrolPoints.Length; i++)
+        {
+            float dist = Vector3.Distance(transform.position, patrolPoints[i].position);
+            if (dist < minDist)
+            {
+                minDist = dist;
+                closest = i;
+            }
+        }
+        return closest;
+    }
+}
